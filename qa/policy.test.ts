@@ -1,6 +1,20 @@
 import { describe, expect, test } from "bun:test";
 
-import { nextPreferredOnModelSelect } from "../src/policy";
+import { isRecoveryStop, nextPreferredOnModelSelect } from "../src/policy";
+
+describe("isRecoveryStop", () => {
+  test("success-family stop reasons mean the session recovered", () => {
+    for (const r of ["stop", "toolUse", "length", "deferred", "STOP"]) {
+      expect(isRecoveryStop(r)).toBe(true);
+    }
+  });
+
+  test("error and abort stop reasons do not", () => {
+    for (const r of ["error", "aborted", "", "tool_error"]) {
+      expect(isRecoveryStop(r)).toBe(false);
+    }
+  });
+});
 
 describe("nextPreferredOnModelSelect", () => {
   test("pinball-initiated switch keeps the current preference", () => {

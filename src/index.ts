@@ -5,7 +5,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { backoffFor, classifyError, DEFAULT_TRANSIENT_BACKOFF_MS, parseResetHint, type ErrorClass } from "./classify";
 import { chainIndex, findNextModel, findPreferredModel, modelKey } from "./chain";
 import { activeFailures, clearFailure, markFailure, type FailureLedger } from "./cooldown";
-import { nextPreferredOnModelSelect } from "./policy";
+import { nextPreferredOnModelSelect, isRecoveryStop } from "./policy";
 
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
 interface PinballConfig {
@@ -94,10 +94,6 @@ function shorten(text: string, max = 90) {
 }
 function normStopReason(msg: { stopReason?: unknown } | null | undefined) { return String(msg?.stopReason ?? "").toLowerCase(); }
 function isErrorStop(msg: { stopReason?: unknown } | null | undefined) { return normStopReason(msg) === "error"; }
-function isSuccessStop(msg: { stopReason?: unknown } | null | undefined) {
-  const r = normStopReason(msg);
-  return r === "stop" || r === "toolUse" || r === "length" || r === "deferred";
-}
 
 export default function pinballExtension(pi: ExtensionAPI) {
   let config: PinballConfig = { ...DEFAULT_CONFIG, models: [] };
@@ -334,7 +330,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
       // the turn is finished and can safely be re-sent.
       if (kind !== "quota") return;
       await bounceAway(ctx, msg.provider, msg.model, errorText, kind, parseResetHint(errorText));
-    } else if (isSuccessStop(msg)) {
+    } else if (isRecoveryStop(normStopReason(msg))) {
       const cur = ctx.model;
       const key = cur ? modelKey(cur) : undefined;
       state.consecutiveFailures = 0;
@@ -344,6 +340,10 @@ export default function pinballExtension(pi: ExtensionAPI) {
         state.transientAttempts.delete(key);
         clearFailure(state, key);
       }
+      // The session recovered (this turn, or a queued one, succeeded): cancel
+      // any same-model retry still pending so its timer cannot fire "retry the
+      // failed step" into a healthy session later.
+      clearTimers();
     }
   });
 
