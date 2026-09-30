@@ -2,16 +2,34 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { backoffFor, classifyError, DEFAULT_TRANSIENT_BACKOFF_MS, parseResetHint, type ErrorClass } from "./classify";
+import { activeFailures, clearFailure, markFailure, type FailureLedger } from "./cooldown";
 
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
-interface PinballConfig { enabled: boolean; maxRetries: number; cooldownMs: number; notifyOnBounce: boolean; models: PinballModel[] }
-interface PinballState {
+interface PinballConfig {
+  enabled: boolean;
+  maxRetries: number;
+  /** Default cooldown for a failed model (also the quota cooldown unless overridden). */
+  cooldownMs: number;
+  notifyOnBounce: boolean;
+  models: PinballModel[];
+  /** Same-model attempts for transient errors before bouncing. */
+  transientRetries?: number;
+  /** Backoff schedule for those attempts, in ms. */
+  transientBackoffMs?: number[];
+  /** Cooldown earned when transient retries are exhausted. */
+  transientCooldownMs?: number;
+  /** Cooldown earned by a quota failure; defaults to `cooldownMs`. */
+  quotaCooldownMs?: number;
+}
+interface PinballState extends FailureLedger {
   currentIndex: number;
   retryCount: number;
   lastBounceTime: number;
   consecutiveFailures: number;
   gaveUp: boolean;
-  failures: Map<string, number>;
+  /** modelKey -> transient retries spent on the current streak. */
+  transientAttempts: Map<string, number>;
   bounceLog: Array<{ from: string; to: string; reason: string; timestamp: number }>;
 }
 type PinballRuntime = {
@@ -25,22 +43,17 @@ type PinballRuntime = {
 
 const CONFIG_FILE = "pinball.json";
 const LEGACY_CONFIG_FILE = "model-bouncer.json";
-const DEFAULT_CONFIG: PinballConfig = { enabled: true, maxRetries: 3, cooldownMs: 60_000, notifyOnBounce: true, models: [] };
+const DEFAULT_CONFIG: PinballConfig = {
+  enabled: true,
+  maxRetries: 3,
+  cooldownMs: 60_000,
+  notifyOnBounce: true,
+  models: [],
+};
 const BOUNCE_DEDUPE_MS = 10_000;
-
-const CONTEXT_OVERFLOW_PATTERNS = [
-  /context window/i, /context length/i, /prompt is too long/i, /maximum context/i,
-  /too many tokens/i, /token limit/i, /request.?too.?large/i, /input.?token/i,
-  /reduce the length/i, /maximum prompt length/i,
-];
-const BOUNCE_ERROR_PATTERNS = [
-  /\b429\b/, /\b402\b/, /\b403\b/, /\b5\d\d\b/, /rate.?limit/i,
-  /too many requests/i, /quota/i, /usage limit/i, /limit reached/i, /insufficient/i,
-  /out of budget/i, /available balance/i, /billing/i, /credit/i, /payment required/i,
-  /subscription/i, /paywall/i, /resource.?exhausted/i, /overloaded/i,
-  /service.?unavailable/i, /temporarily.?unavailable/i, /server Error/i,
-  /chatgpt usage limit/i, /hit your .* limit/i,
-];
+const DEFAULT_TRANSIENT_COOLDOWN_MS = 60_000;
+/** Multiplier applied to the cooldown of a model that could not be set at all. */
+const UNREACHABLE_COOLDOWN_FACTOR = 10;
 
 function configPath() { return join(getAgentDir(), CONFIG_FILE); }
 function loadConfig(): PinballConfig {
@@ -81,21 +94,15 @@ function isSuccessStop(msg: { stopReason?: unknown } | null | undefined) {
   const r = normStopReason(msg);
   return r === "stop" || r === "toolUse" || r === "length" || r === "deferred";
 }
-function isBounceWorthyError(text: string) {
-  return !!text && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(text)) && BOUNCE_ERROR_PATTERNS.some((p) => p.test(text));
-}
-function countActiveFailures(st: PinballState, cooldownMs: number) {
-  const now = Date.now();
-  let count = 0;
-  for (const ts of st.failures.values()) if (now - ts < cooldownMs) count++;
-  return count;
-}
 
 export default function pinballExtension(pi: ExtensionAPI) {
   let config: PinballConfig = { ...DEFAULT_CONFIG, models: [] };
   let configLoaded = false;
   let originalModel: { provider: string; id: string } | null = null;
   let pendingRetryMessage: string | null = null;
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  /** modelKeys with a same-model transient retry already scheduled. */
+  const pendingTransient = new Set<string>();
   const state: PinballState = {
     currentIndex: 0,
     retryCount: 0,
@@ -103,6 +110,8 @@ export default function pinballExtension(pi: ExtensionAPI) {
     consecutiveFailures: 0,
     gaveUp: false,
     failures: new Map(),
+    cooldowns: new Map(),
+    transientAttempts: new Map(),
     bounceLog: [],
   };
 
@@ -121,12 +130,27 @@ export default function pinballExtension(pi: ExtensionAPI) {
     state.consecutiveFailures = 0;
     state.gaveUp = false;
     state.failures.clear();
+    state.cooldowns.clear();
+    state.transientAttempts.clear();
     if (clearLog) state.bounceLog = [];
   }
+  function clearTimers() {
+    for (const t of timers) clearTimeout(t);
+    timers.clear();
+    pendingTransient.clear();
+  }
+
+  // --- cooldown policy ---------------------------------------------------------
+
+  function quotaCooldownMs() { return ensureConfig().quotaCooldownMs ?? ensureConfig().cooldownMs; }
+  function transientCooldownMs() { return ensureConfig().transientCooldownMs ?? DEFAULT_TRANSIENT_COOLDOWN_MS; }
+  function transientRetryBudget() { return Math.max(0, ensureConfig().transientRetries ?? 3); }
+  function backoffSchedule() { return ensureConfig().transientBackoffMs ?? DEFAULT_TRANSIENT_BACKOFF_MS; }
+
   function updateStatus(ctx: ExtensionContext) {
     const cfg = ensureConfig();
     if (!cfg.enabled) { ctx.ui.setStatus("pinball", undefined); return; }
-    const failures = countActiveFailures(state, cfg.cooldownMs);
+    const failures = activeFailures(state, cfg.cooldownMs).length;
     const label = failures > 0 ? `🎯 (on ${failures})` : "🎯 (on)";
     ctx.ui.setStatus("pinball", ctx.ui.theme.fg(failures > 0 ? "warning" : "success", label));
   }
@@ -153,45 +177,64 @@ export default function pinballExtension(pi: ExtensionAPI) {
     return null;
   }
 
-  async function bounceToModel(ctx: ExtensionContext, target: PinballModel) {
+  function logBounce(from: string, to: string, reason: string) {
+    state.bounceLog.push({ from, to, reason, timestamp: Date.now() });
+    if (state.bounceLog.length > 50) state.bounceLog = state.bounceLog.slice(-50);
+  }
+
+  // --- model switching ---------------------------------------------------------
+
+  async function bounceToModel(ctx: ExtensionContext, target: PinballModel, reason: string) {
     const current = ctx.model;
     if (current?.provider === target.provider && current.id === target.id) return true;
     try {
       const model = ctx.modelRegistry.find(target.provider, target.id);
       if (!model || !(await pi.setModel(model))) throw new Error("unavailable");
     } catch {
-      state.failures.set(modelKey(target), Date.now() + config.cooldownMs * 10);
+      markFailure(state, modelKey(target), Date.now(), ensureConfig().cooldownMs * UNREACHABLE_COOLDOWN_FACTOR);
       return false;
     }
     state.currentIndex = config.models.findIndex((m) => m.provider === target.provider && m.id === target.id);
-    state.bounceLog.push({
-      from: originalModel ? modelKey(originalModel) : "unknown",
-      to: modelKey(target),
-      reason: "rate-limit/quota",
-      timestamp: Date.now(),
-    });
-    if (state.bounceLog.length > 50) state.bounceLog = state.bounceLog.slice(-50);
-    pendingRetryMessage = `[pinball] Switched to ${modelKey(target)} after provider error.\nRetry last action.`;
+    logBounce(current ? modelKey(current) : (originalModel ? modelKey(originalModel) : "unknown"), modelKey(target), reason);
     return true;
   }
 
-  async function bounceAway(ctx: ExtensionContext, failedProvider: string, failedModel: string, errorText: string) {
+  /**
+   * Switch to the next available model. `kind` decides the cooldown the failed
+   * model earns: quota failures rest long, exhausted transient retries rest
+   * briefly.
+   */
+  async function bounceAway(
+    ctx: ExtensionContext,
+    failedProvider: string,
+    failedModel: string,
+    errorText: string,
+    kind: ErrorClass,
+    resetHintMs?: number | null,
+  ) {
     const cfg = ensureConfig();
-    if (!cfg.enabled || !failedProvider || !failedModel) return null;
+    if (!cfg.enabled || !failedProvider || !failedModel || kind === "fatal") return null;
     const failedKey = `${failedProvider}/${failedModel}`;
     const now = Date.now();
-    const lastFailure = state.failures.get(failedKey);
-    if (lastFailure && now - lastFailure < BOUNCE_DEDUPE_MS) return findNextAvailableModel(failedKey);
-
-    state.failures.set(failedKey, now);
-    state.retryCount++;
-    state.lastBounceTime = now;
     if (!originalModel) originalModel = { provider: failedProvider, id: failedModel };
 
-    const maxAttempts = Math.max(1, config.maxRetries) * Math.max(1, config.models.length);
+    const cooldown = kind === "quota"
+      ? Math.max(quotaCooldownMs(), resetHintMs ?? 0)
+      : transientCooldownMs();
+    const lastFailure = state.failures.get(failedKey);
+    if (lastFailure !== undefined && now - lastFailure < BOUNCE_DEDUPE_MS) {
+      return findNextAvailableModel(failedKey);
+    }
+
+    markFailure(state, failedKey, now, cooldown);
+    state.transientAttempts.delete(failedKey);
+    state.retryCount++;
+    state.lastBounceTime = now;
+
+    const maxAttempts = Math.max(1, cfg.maxRetries) * Math.max(1, cfg.models.length);
     if (state.consecutiveFailures > maxAttempts) {
       state.gaveUp = true;
-      ctx.ui.notify(`pinball: ${maxAttempts} attempts exhausted; stopped (/pinball reset).`, "Error");
+      ctx.ui.notify(`pinball: ${maxAttempts} attempts exhausted; stopped (/pinball reset).`, "error");
       updateStatus(ctx);
       return null;
     }
@@ -199,25 +242,62 @@ export default function pinballExtension(pi: ExtensionAPI) {
     for (let i = 0; i < config.models.length; i++) {
       const target = findNextAvailableModel(failedKey);
       if (!target) break;
-      if (await bounceToModel(ctx, target)) {
-        if (config.notifyOnBounce) ctx.ui.notify(`🔄 ${failedKey} → ${modelKey(target)} (${shorten(errorText)})`, "info");
+      const targetKey = modelKey(target);
+      if (await bounceToModel(ctx, target, kind)) {
+        if (cfg.notifyOnBounce) {
+          const wait = cooldown > cfg.cooldownMs ? ` (cooldown ${formatDuration(cooldown)})` : "";
+          ctx.ui.notify(`🔄 ${failedKey} → ${targetKey} (${shorten(errorText)})${wait}`, "info");
+        }
         updateStatus(ctx);
         return target;
       }
     }
-    ctx.ui.notify(`pinball: no models (${shorten(errorText)}).`, "Error");
+    ctx.ui.notify(`pinball: no models (${shorten(errorText)}).`, "error");
     updateStatus(ctx);
     return null;
   }
 
-  function retryMessage(failedKey: string, targetKey: string, errorText: string) {
+  // --- continuation plumbing ---------------------------------------------------
+
+  async function dispatchRetry(text: string) {
+    try { await pi.sendUserMessage(text); }
+    catch (err) { console.warn(`[pinball] retry failed: ${err}`); }
+  }
+
+  /** Re-send the failed turn on the *same* model after `delayMs`. */
+  function scheduleTransientRetry(ctx: ExtensionContext, key: string, text: string, delayMs: number) {
+    if (pendingTransient.has(key)) return;
+    pendingTransient.add(key);
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      pendingTransient.delete(key);
+      if (!ensureConfig().enabled) return;
+      if (ctx.isIdle()) void dispatchRetry(text);
+      else pendingRetryMessage = text;
+    }, delayMs);
+    timers.add(timer);
+  }
+
+  function transientRetryMessage(key: string, attempt: number, total: number, delayMs: number, errorText: string) {
+    return `[pinball] ${key} transient provider error (${shorten(errorText, 140)}). Same-model retry ${attempt}/${total} in ${formatDuration(delayMs)}; do not switch models. Continue the task; retry the failed step.`;
+  }
+  function bounceRetryMessage(failedKey: string, targetKey: string, errorText: string) {
     return `[pinball] ${failedKey} hit provider limit/error (${shorten(errorText, 140)}). Switched to ${targetKey}. Continue the task; retry the failed step.`;
   }
 
+  // --- events ------------------------------------------------------------------
+
   pi.on("after_provider_response", async (event, ctx) => {
-    if (!ensureConfig().enabled || ![429, 402, 403].includes(event.status)) return;
+    if (!ensureConfig().enabled) return;
+    const text = `HTTP ${event.status}`;
+    const headers = (event.headers ?? {}) as Record<string, string>;
+    const kind = classifyError(text, { status: event.status, headers });
+    // Quota failures bounce immediately. Transient failures are retried on the
+    // same model at settle time; fatal errors never bounce.
+    if (kind !== "quota") return;
     const cur = ctx.model;
-    if (cur) await bounceAway(ctx, cur.provider, cur.id, `HTTP ${event.status}`);
+    if (!cur) return;
+    await bounceAway(ctx, cur.provider, cur.id, text, kind, parseResetHint("", headers));
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -225,16 +305,29 @@ export default function pinballExtension(pi: ExtensionAPI) {
     if (msg.role !== "assistant") return;
     if (isErrorStop(msg)) {
       const errorText = msg.errorMessage ?? "";
-      if (isBounceWorthyError(errorText)) await bounceAway(ctx, msg.provider, msg.model, errorText);
+      const kind = classifyError(errorText);
+      // Transient errors are retried on the same model at agent_settled, where
+      // the turn is finished and can safely be re-sent.
+      if (kind !== "quota") return;
+      await bounceAway(ctx, msg.provider, msg.model, errorText, kind, parseResetHint(errorText));
     } else if (isSuccessStop(msg)) {
+      const cur = ctx.model;
+      const key = cur ? modelKey(cur) : undefined;
       state.consecutiveFailures = 0;
       state.gaveUp = false;
       pendingRetryMessage = null;
+      if (key) {
+        state.transientAttempts.delete(key);
+        clearFailure(state, key);
+      }
     }
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!ensureConfig().enabled || state.gaveUp) return;
+    const cfg = ensureConfig();
+    if (!cfg.enabled || state.gaveUp) return;
+    const cur = ctx.model;
+    if (cur && !originalModel) originalModel = { provider: cur.provider, id: cur.id };
     let lastError: string | null = null;
     let lastProvider = "";
     let lastModel = "";
@@ -245,40 +338,52 @@ export default function pinballExtension(pi: ExtensionAPI) {
       if (entry.type !== "message") continue;
       const m = entry.message;
       if (m.role === "assistant") {
-        if (isErrorStop(m) && isBounceWorthyError(m.errorMessage ?? "")) {
-          lastError = m.errorMessage ?? "";
-          lastProvider = m.provider;
-          lastModel = m.model;
-        }
+        if (isErrorStop(m) && m.errorMessage) { lastError = m.errorMessage; lastProvider = m.provider; lastModel = m.model; }
         break;
       }
     }
     if (!lastError || !lastProvider) return;
 
+    const kind = classifyError(lastError);
+    if (kind === "fatal") return;
     const failedKey = `${lastProvider}/${lastModel}`;
-    const target = await bounceAway(ctx, lastProvider, lastModel, lastError);
+
+    if (kind === "transient") {
+      const budget = transientRetryBudget();
+      const spent = state.transientAttempts.get(failedKey) ?? 0;
+      if (spent < budget && !pendingTransient.has(failedKey)) {
+        const attempt = spent + 1;
+        const delayMs = backoffFor(attempt, backoffSchedule());
+        state.transientAttempts.set(failedKey, attempt);
+        state.retryCount++;
+        if (cfg.notifyOnBounce) {
+          ctx.ui.notify(`⏳ ${failedKey} transient error; retry ${attempt}/${budget} on the same model in ${formatDuration(delayMs)}`, "info");
+        }
+        updateStatus(ctx);
+        scheduleTransientRetry(ctx, failedKey, transientRetryMessage(failedKey, attempt, budget, delayMs, lastError), delayMs);
+        return;
+      }
+    }
+
+    const resetHintMs = kind === "quota" ? parseResetHint(lastError) : null;
+    const target = await bounceAway(ctx, lastProvider, lastModel, lastError, kind, resetHintMs);
     if (!target || modelKey(target) === failedKey) {
-      ctx.ui.notify(`pinball: no continuation model (${shorten(lastError)}).`, "Error");
+      if (kind === "transient") ctx.ui.notify(`pinball: no continuation model (${shorten(lastError)}).`, "error");
       return;
     }
 
     pendingRetryMessage = null;
     state.consecutiveFailures++;
-    const maxAttempts = Math.max(1, config.maxRetries) * Math.max(1, config.models.length);
+    const maxAttempts = Math.max(1, cfg.maxRetries) * Math.max(1, cfg.models.length);
     if (state.consecutiveFailures > maxAttempts) {
       state.gaveUp = true;
-      ctx.ui.notify(`pinball: ${maxAttempts} attempts exhausted; stopped (/pinball reset).`, "Error");
+      ctx.ui.notify(`pinball: ${maxAttempts} attempts exhausted; stopped (/pinball reset).`, "error");
       return;
     }
 
-    ctx.ui.notify(`🔄 ${failedKey} → ${modelKey(target)}; retrying…`, "info");
-    const text = retryMessage(failedKey, modelKey(target), lastError);
-    if (ctx.isIdle()) {
-      try { await pi.sendUserMessage(text); }
-      catch (err) { console.warn(`[pinball] retry failed: ${err}`); }
-    } else {
-      pendingRetryMessage = text;
-    }
+    const text = bounceRetryMessage(failedKey, modelKey(target), lastError);
+    if (ctx.isIdle()) await dispatchRetry(text);
+    else pendingRetryMessage = text;
   });
 
   pi.on("before_agent_start", async () => {
@@ -299,13 +404,15 @@ export default function pinballExtension(pi: ExtensionAPI) {
         case "enable":
           config.enabled = true; persistConfig(); ctx.ui.notify("pinball: on", "info"); updateStatus(ctx); break;
         case "disable":
-          config.enabled = false; persistConfig(); ctx.ui.notify("pinball: off", "info"); updateStatus(ctx); break;
+          config.enabled = false; persistConfig(); clearTimers(); ctx.ui.notify("pinball: off", "info"); updateStatus(ctx); break;
         case "reset":
-          state.failures.clear(); state.retryCount = 0; state.consecutiveFailures = 0; state.gaveUp = false;
+          clearTimers();
+          state.failures.clear(); state.cooldowns.clear(); state.transientAttempts.clear();
+          state.retryCount = 0; state.consecutiveFailures = 0; state.gaveUp = false;
           ctx.ui.notify("pinball: reset", "info"); updateStatus(ctx); break;
         case "status": case "config": case "list": case "add": case "remove": case "test": case "log":
           try { await (await loadCommands()).handlePinballCommand(sub, pi, ctx, runtime); }
-          catch (err) { console.error(`[pinball] command load: ${err}`); ctx.ui.notify(`pinball: command unavailable (${shorten(String(err))})`, "Error"); }
+          catch (err) { console.error(`[pinball] command load: ${err}`); ctx.ui.notify(`pinball: command unavailable (${shorten(String(err))})`, "error"); }
           break;
         default:
           config.enabled = !config.enabled; persistConfig(); ctx.ui.notify(`pinball: ${config.enabled ? "on" : "off"}`, "info"); updateStatus(ctx);
@@ -314,6 +421,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    clearTimers();
     config = loadConfig();
     configLoaded = true;
     originalModel = null;
@@ -321,4 +429,6 @@ export default function pinballExtension(pi: ExtensionAPI) {
     resetState();
     updateStatus(ctx);
   });
+
+  pi.on("session_shutdown", async () => { clearTimers(); });
 }

@@ -1,9 +1,21 @@
 import { SettingsList } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import { activeFailures, isCooling } from "./cooldown";
+
 interface SelectItem<T> { value: T; label: string; description?: string }
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
-interface PinballConfig { enabled: boolean; maxRetries: number; cooldownMs: number; notifyOnBounce: boolean; models: PinballModel[] }
+interface PinballConfig {
+  enabled: boolean;
+  maxRetries: number;
+  cooldownMs: number;
+  notifyOnBounce: boolean;
+  models: PinballModel[];
+  transientRetries?: number;
+  transientBackoffMs?: number[];
+  transientCooldownMs?: number;
+  quotaCooldownMs?: number;
+}
 interface PinballState {
   currentIndex: number;
   retryCount: number;
@@ -11,6 +23,8 @@ interface PinballState {
   consecutiveFailures: number;
   gaveUp: boolean;
   failures: Map<string, number>;
+  cooldowns: Map<string, number>;
+  transientAttempts: Map<string, number>;
   bounceLog: Array<{ from: string; to: string; reason: string; timestamp: number }>;
 }
 type PinballRuntime = {
@@ -69,6 +83,14 @@ function applyConfigSetting(ctx: ExtensionContext, rt: PinballRuntime, id: strin
       config.maxRetries = Number(newValue) || config.maxRetries;
       ctx.ui.notify(`Retries: ${config.maxRetries}`, "info");
       break;
+    case "transient-retries":
+      config.transientRetries = Number(newValue) || config.transientRetries;
+      ctx.ui.notify(`Transient retries: ${config.transientRetries}`, "info");
+      break;
+    case "transient-backoff":
+      config.transientBackoffMs = { "quick": [5_000, 15_000, 45_000], "default": [15_000, 60_000, 180_000], "patient": [30_000, 120_000, 300_000] }[newValue] ?? config.transientBackoffMs;
+      ctx.ui.notify(`Transient backoff: ${newValue}`, "info");
+      break;
     case "notify":
       config.notifyOnBounce = newValue === "on";
       ctx.ui.notify(`Notify: ${config.notifyOnBounce ? "on" : "off"}`, "info");
@@ -86,7 +108,8 @@ async function dispatchConfigAction(pi: ExtensionAPI, ctx: ExtensionContext, rt:
     case "remove": await removeModelInteractive(ctx, rt); break;
     case "test": await testAllProviders(pi, ctx, rt); break;
     case "reset":
-      rt.state.failures.clear(); rt.state.retryCount = 0; rt.state.consecutiveFailures = 0; rt.state.gaveUp = false;
+      rt.state.failures.clear(); rt.state.cooldowns.clear(); rt.state.transientAttempts.clear();
+      rt.state.retryCount = 0; rt.state.consecutiveFailures = 0; rt.state.gaveUp = false;
       ctx.ui.notify("pinball: reset", "info"); rt.updateStatus(ctx); break;
   }
 }
@@ -103,8 +126,7 @@ function buildListSubmenu(
   const buildItems = () => {
     const items = config.models.map((m, i) => {
       const key = modelKey(m);
-      const failureTime = state.failures.get(key);
-      const inCooldown = failureTime && Date.now() - failureTime < config.cooldownMs;
+      const inCooldown = isCooling(state, key, config.cooldownMs);
       const status = inCooldown ? "⏳" : "";
       return {
         id: `${i}|${key}`,
@@ -353,9 +375,8 @@ async function showStatus(ctx: ExtensionContext, rt: PinballRuntime) {
   const state = rt.state;
   const currentModel = ctx.model;
   const currentKey = currentModel ? modelKey(currentModel) : "unknown";
-  const now = Date.now();
-  let activeFailures = 0;
-  for (const ts of state.failures.values()) if (now - ts < config.cooldownMs) activeFailures++;
+  const cooling = activeFailures(state, config.cooldownMs).length;
+  const transientRetries = config.transientRetries ?? 3;
 
   const lines = [
     `State: ${config.enabled ? "✅ on" : "❌ off"}`,
@@ -363,8 +384,9 @@ async function showStatus(ctx: ExtensionContext, rt: PinballRuntime) {
     `List: ${config.models.length}`,
     `Retries: ${state.retryCount}/${config.maxRetries * config.models.length}`,
     `Streak: ${state.consecutiveFailures}`,
-    `Cooldowns: ${activeFailures}`,
-    `Cooldown: ${formatDuration(config.cooldownMs)}`,
+    `Cooldowns: ${cooling}`,
+    `Cooldown: ${formatDuration(config.quotaCooldownMs ?? config.cooldownMs)} quota / ${formatDuration(config.transientCooldownMs ?? 60_000)} transient`,
+    `Transient retries: ${transientRetries} (${(config.transientBackoffMs ?? [15_000, 60_000, 180_000]).map(formatDuration).join(" → ")})`,
   ];
   const original = rt.getOriginalModel();
   if (original) lines.push(`Original: ${modelKey(original)}`);
