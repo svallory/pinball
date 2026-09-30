@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { backoffFor, classifyError, DEFAULT_TRANSIENT_BACKOFF_MS, parseResetHint, type ErrorClass } from "./classify";
+import { chainIndex, findPreferredModel, modelKey } from "./chain";
 import { activeFailures, clearFailure, markFailure, type FailureLedger } from "./cooldown";
 
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
@@ -21,6 +22,8 @@ interface PinballConfig {
   transientCooldownMs?: number;
   /** Cooldown earned by a quota failure; defaults to `cooldownMs`. */
   quotaCooldownMs?: number;
+  /** Switch back to the preferred model once it is out of cooldown. */
+  returnToPreferred?: boolean;
 }
 interface PinballState extends FailureLedger {
   currentIndex: number;
@@ -48,6 +51,7 @@ const DEFAULT_CONFIG: PinballConfig = {
   maxRetries: 3,
   cooldownMs: 60_000,
   notifyOnBounce: true,
+  returnToPreferred: true,
   models: [],
 };
 const BOUNCE_DEDUPE_MS = 10_000;
@@ -77,7 +81,6 @@ function saveConfig(config: PinballConfig) {
   catch (err) { console.error(`[pinball] config save: ${err}`); }
 }
 
-function modelKey(m: { provider: string; id: string }) { return `${m.provider}/${m.id}`; }
 function formatDuration(ms: number) {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
@@ -194,7 +197,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
       markFailure(state, modelKey(target), Date.now(), ensureConfig().cooldownMs * UNREACHABLE_COOLDOWN_FACTOR);
       return false;
     }
-    state.currentIndex = config.models.findIndex((m) => m.provider === target.provider && m.id === target.id);
+    state.currentIndex = chainIndex(config.models, modelKey(target));
     logBounce(current ? modelKey(current) : (originalModel ? modelKey(originalModel) : "unknown"), modelKey(target), reason);
     return true;
   }
@@ -255,6 +258,27 @@ export default function pinballExtension(pi: ExtensionAPI) {
     ctx.ui.notify(`pinball: no models (${shorten(errorText)}).`, "error");
     updateStatus(ctx);
     return null;
+  }
+
+  /** Switch back to the earliest model earlier in the chain that is off cooldown. */
+  async function returnToPreferredModel(ctx: ExtensionContext) {
+    const cfg = ensureConfig();
+    const current = ctx.model;
+    const currentKey = current ? modelKey(current) : undefined;
+    if (currentKey && originalModel && currentKey === modelKey(originalModel)) return false;
+    const target = findPreferredModel(config.models, state, {
+      currentKey,
+      originalKey: originalModel ? modelKey(originalModel) : null,
+      fallbackCooldownMs: cfg.cooldownMs,
+    });
+    if (!target) return false;
+    const targetKey = modelKey(target);
+    if (!(await bounceToModel(ctx, target as PinballModel, "return-to-preferred"))) return false;
+    if (cfg.notifyOnBounce) {
+      ctx.ui.notify(`↩️ ${currentKey ?? "unknown"} → ${targetKey} (back to preferred)`, "info");
+    }
+    updateStatus(ctx);
+    return true;
   }
 
   // --- continuation plumbing ---------------------------------------------------
@@ -386,7 +410,11 @@ export default function pinballExtension(pi: ExtensionAPI) {
     else pendingRetryMessage = text;
   });
 
-  pi.on("before_agent_start", async () => {
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (ensureConfig().enabled && ensureConfig().returnToPreferred !== false && !state.gaveUp) {
+      try { await returnToPreferredModel(ctx); }
+      catch (err) { console.warn(`[pinball] return-to-preferred failed: ${err}`); }
+    }
     if (!pendingRetryMessage) return;
     const content = pendingRetryMessage;
     pendingRetryMessage = null;
@@ -424,7 +452,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
     clearTimers();
     config = loadConfig();
     configLoaded = true;
-    originalModel = null;
+    originalModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
     pendingRetryMessage = null;
     resetState();
     updateStatus(ctx);

@@ -15,6 +15,7 @@ interface PinballConfig {
   transientBackoffMs?: number[];
   transientCooldownMs?: number;
   quotaCooldownMs?: number;
+  returnToPreferred?: boolean;
 }
 interface PinballState {
   currentIndex: number;
@@ -90,6 +91,10 @@ function applyConfigSetting(ctx: ExtensionContext, rt: PinballRuntime, id: strin
     case "transient-backoff":
       config.transientBackoffMs = { "quick": [5_000, 15_000, 45_000], "default": [15_000, 60_000, 180_000], "patient": [30_000, 120_000, 300_000] }[newValue] ?? config.transientBackoffMs;
       ctx.ui.notify(`Transient backoff: ${newValue}`, "info");
+      break;
+    case "return-to-preferred":
+      config.returnToPreferred = newValue === "on";
+      ctx.ui.notify(`Return to preferred: ${config.returnToPreferred ? "on" : "off"}`, "info");
       break;
     case "notify":
       config.notifyOnBounce = newValue === "on";
@@ -387,6 +392,7 @@ async function showStatus(ctx: ExtensionContext, rt: PinballRuntime) {
     `Cooldowns: ${cooling}`,
     `Cooldown: ${formatDuration(config.quotaCooldownMs ?? config.cooldownMs)} quota / ${formatDuration(config.transientCooldownMs ?? 60_000)} transient`,
     `Transient retries: ${transientRetries} (${(config.transientBackoffMs ?? [15_000, 60_000, 180_000]).map(formatDuration).join(" → ")})`,
+    `Return to preferred: ${config.returnToPreferred === false ? "off" : "on"}`,
   ];
   const original = rt.getOriginalModel();
   if (original) lines.push(`Original: ${modelKey(original)}`);
