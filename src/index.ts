@@ -5,7 +5,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { backoffFor, classifyError, DEFAULT_TRANSIENT_BACKOFF_MS, parseResetHint, type ErrorClass } from "./classify";
 import { chainIndex, findNextModel, findPreferredModel, modelKey } from "./chain";
 import { activeFailures, clearFailure, markFailure, type FailureLedger } from "./cooldown";
-import { nextPreferredOnModelSelect, isRecoveryStop } from "./policy";
+import { isRecoveryStop, nextPreferredOnModelSelect, shouldCancelRetriesOnInput, shouldScheduleRetryAfterSettle } from "./policy";
 
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
 interface PinballConfig {
@@ -102,6 +102,8 @@ export default function pinballExtension(pi: ExtensionAPI) {
   let pendingRetryMessage: string | null = null;
   /** True while pinball itself is switching models (suppresses model_select handling). */
   let selfModelSwitch = false;
+  /** Outcome of the most recent turn boundary ("completed" | "aborted" | "error"), if any. */
+  let lastBoundaryOutcome: string | null = null;
   const timers = new Set<ReturnType<typeof setTimeout>>();
   /** modelKeys with a same-model transient retry already scheduled. */
   const pendingTransient = new Set<string>();
@@ -350,6 +352,11 @@ export default function pinballExtension(pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     const cfg = ensureConfig();
     if (!cfg.enabled || state.gaveUp) return;
+    // An operator abort (Esc) means "stay stopped": never schedule a retry
+    // for a turn they interrupted.
+    const boundaryOutcome = lastBoundaryOutcome;
+    lastBoundaryOutcome = null;
+    if (!shouldScheduleRetryAfterSettle(boundaryOutcome)) return;
     const cur = ctx.model;
     if (cur && !originalModel) originalModel = { provider: cur.provider, id: cur.id };
     let lastError: string | null = null;
@@ -408,6 +415,22 @@ export default function pinballExtension(pi: ExtensionAPI) {
     const text = bounceRetryMessage(failedKey, modelKey(target), lastError);
     if (ctx.isIdle()) await dispatchRetry(text);
     else pendingRetryMessage = text;
+  });
+
+  pi.on("agent_before_settle", (event) => {
+    lastBoundaryOutcome = event.outcome;
+  });
+
+  pi.on("turn_end", (event) => {
+    lastBoundaryOutcome = event.outcome;
+  });
+
+  pi.on("input", (event) => {
+    if (!shouldCancelRetriesOnInput(event.source)) return;
+    // The operator typed something: a fresh prompt cancels any scheduled
+    // retry and any parked retry continuation.
+    clearTimers();
+    pendingRetryMessage = null;
   });
 
   pi.on("model_select", (event) => {

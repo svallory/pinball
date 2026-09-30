@@ -31,3 +31,23 @@ const RECOVERY_STOPS = new Set(["stop", "tooluse", "length", "deferred"]);
 export function isRecoveryStop(stopReason: string): boolean {
   return RECOVERY_STOPS.has(stopReason.toLowerCase());
 }
+
+/**
+ * Input the operator typed themselves supersedes any scheduled retry — fresh
+ * interactive input cancels pending same-model retries and parked retry
+ * continuations. Extension- and rpc-sourced input is machine-driven and
+ * leaves retries alone.
+ */
+export function shouldCancelRetriesOnInput(source: string): boolean {
+  return source === "interactive";
+}
+
+/**
+ * Whether a settled turn deserves a retry. An operator abort (Esc) means
+ * "stay stopped": scheduling a retry for a turn they interrupted makes the
+ * agent resume on its own up to the backoff maximum later. An unknown
+ * (null) outcome keeps the old behavior.
+ */
+export function shouldScheduleRetryAfterSettle(outcome: string | null): boolean {
+  return outcome !== "aborted";
+}

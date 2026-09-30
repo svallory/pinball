@@ -1,6 +1,29 @@
 import { describe, expect, test } from "bun:test";
 
-import { isRecoveryStop, nextPreferredOnModelSelect } from "../src/policy";
+import { isRecoveryStop, nextPreferredOnModelSelect, shouldCancelRetriesOnInput, shouldScheduleRetryAfterSettle } from "../src/policy";
+
+describe("shouldCancelRetriesOnInput", () => {
+  test("interactive input cancels scheduled retries", () => {
+    expect(shouldCancelRetriesOnInput("interactive")).toBe(true);
+  });
+
+  test("extension and rpc input leave retries alone", () => {
+    expect(shouldCancelRetriesOnInput("extension")).toBe(false);
+    expect(shouldCancelRetriesOnInput("rpc")).toBe(false);
+  });
+});
+
+describe("shouldScheduleRetryAfterSettle", () => {
+  test("an aborted turn never schedules a retry", () => {
+    expect(shouldScheduleRetryAfterSettle("aborted")).toBe(false);
+  });
+
+  test("completed, errored, and unknown turns keep the old behavior", () => {
+    expect(shouldScheduleRetryAfterSettle("completed")).toBe(true);
+    expect(shouldScheduleRetryAfterSettle("error")).toBe(true);
+    expect(shouldScheduleRetryAfterSettle(null)).toBe(true);
+  });
+});
 
 describe("isRecoveryStop", () => {
   test("success-family stop reasons mean the session recovered", () => {
