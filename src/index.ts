@@ -5,6 +5,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { backoffFor, classifyError, DEFAULT_TRANSIENT_BACKOFF_MS, parseResetHint, type ErrorClass } from "./classify";
 import { chainIndex, findNextModel, findPreferredModel, modelKey } from "./chain";
 import { activeFailures, clearFailure, markFailure, type FailureLedger } from "./cooldown";
+import { nextPreferredOnModelSelect } from "./policy";
 
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
 interface PinballConfig {
@@ -103,6 +104,8 @@ export default function pinballExtension(pi: ExtensionAPI) {
   let configLoaded = false;
   let originalModel: { provider: string; id: string } | null = null;
   let pendingRetryMessage: string | null = null;
+  /** True while pinball itself is switching models (suppresses model_select handling). */
+  let selfModelSwitch = false;
   const timers = new Set<ReturnType<typeof setTimeout>>();
   /** modelKeys with a same-model transient retry already scheduled. */
   const pendingTransient = new Set<string>();
@@ -180,8 +183,15 @@ export default function pinballExtension(pi: ExtensionAPI) {
     if (current?.provider === target.provider && current.id === target.id) return true;
     try {
       const model = ctx.modelRegistry.find(target.provider, target.id);
-      if (!model || !(await pi.setModel(model))) throw new Error("unavailable");
+      if (!model) throw new Error("unavailable");
+      // pi emits model_select and awaits handlers before setModel resolves,
+      // so the flag is consumed by the handler within this await.
+      selfModelSwitch = true;
+      const switched = await pi.setModel(model);
+      selfModelSwitch = false;
+      if (!switched) throw new Error("unavailable");
     } catch {
+      selfModelSwitch = false;
       markFailure(state, modelKey(target), Date.now(), ensureConfig().cooldownMs * UNREACHABLE_COOLDOWN_FACTOR);
       return false;
     }
@@ -398,6 +408,23 @@ export default function pinballExtension(pi: ExtensionAPI) {
     const text = bounceRetryMessage(failedKey, modelKey(target), lastError);
     if (ctx.isIdle()) await dispatchRetry(text);
     else pendingRetryMessage = text;
+  });
+
+  pi.on("model_select", (event) => {
+    const next = nextPreferredOnModelSelect({
+      selfInitiated: selfModelSwitch,
+      provider: event.model.provider,
+      id: event.model.id,
+    });
+    selfModelSwitch = false;
+    if (!next) return;
+    // The operator picked this model themselves (manual pick, cycle, or
+    // restore): it becomes the new preferred model so return-to-preferred
+    // never switches away from it, and any retry pending for the old model
+    // is moot — do not fight the operator.
+    originalModel = next;
+    clearTimers();
+    pendingRetryMessage = null;
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
