@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { backoffFor, classifyError, DEFAULT_TRANSIENT_BACKOFF_MS, parseResetHint, type ErrorClass } from "./classify";
-import { chainIndex, findPreferredModel, modelKey } from "./chain";
+import { chainIndex, findNextModel, findPreferredModel, modelKey } from "./chain";
 import { activeFailures, clearFailure, markFailure, type FailureLedger } from "./cooldown";
 
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
@@ -168,18 +168,6 @@ export default function pinballExtension(pi: ExtensionAPI) {
   let commandsPromise: Promise<typeof import("./commands")> | null = null;
   function loadCommands() { return commandsPromise ??= import("./commands"); }
 
-  function findNextAvailableModel(excludeKey?: string) {
-    const now = Date.now();
-    for (const model of config.models) {
-      const key = modelKey(model);
-      if (excludeKey && key === excludeKey) continue;
-      const lastFailure = state.failures.get(key);
-      if (lastFailure && now - lastFailure < config.cooldownMs) continue;
-      return model;
-    }
-    return null;
-  }
-
   function logBounce(from: string, to: string, reason: string) {
     state.bounceLog.push({ from, to, reason, timestamp: Date.now() });
     if (state.bounceLog.length > 50) state.bounceLog = state.bounceLog.slice(-50);
@@ -203,9 +191,9 @@ export default function pinballExtension(pi: ExtensionAPI) {
   }
 
   /**
-   * Switch to the next available model. `kind` decides the cooldown the failed
-   * model earns: quota failures rest long, exhausted transient retries rest
-   * briefly.
+   * Switch to the next model in chain order. `kind` decides the cooldown the
+   * failed model earns: quota failures rest long, exhausted transient retries
+   * rest briefly.
    */
   async function bounceAway(
     ctx: ExtensionContext,
@@ -226,7 +214,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
       : transientCooldownMs();
     const lastFailure = state.failures.get(failedKey);
     if (lastFailure !== undefined && now - lastFailure < BOUNCE_DEDUPE_MS) {
-      return findNextAvailableModel(failedKey);
+      return findNextModel(config.models, state, { failedKey, fallbackCooldownMs: cfg.cooldownMs, now });
     }
 
     markFailure(state, failedKey, now, cooldown);
@@ -242,8 +230,9 @@ export default function pinballExtension(pi: ExtensionAPI) {
       return null;
     }
 
+    let cursor: number | undefined;
     for (let i = 0; i < config.models.length; i++) {
-      const target = findNextAvailableModel(failedKey);
+      const target = findNextModel(config.models, state, { failedKey, afterIndex: cursor, fallbackCooldownMs: cfg.cooldownMs });
       if (!target) break;
       const targetKey = modelKey(target);
       if (await bounceToModel(ctx, target, kind)) {
@@ -254,6 +243,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
         updateStatus(ctx);
         return target;
       }
+      cursor = chainIndex(config.models, targetKey);
     }
     ctx.ui.notify(`pinball: no models (${shorten(errorText)}).`, "error");
     updateStatus(ctx);

@@ -1,8 +1,8 @@
 /**
- * Chain selection: which model to return to once the preferred one is out of
- * cooldown.
+ * Chain selection: which model to use after a failure, and which model to
+ * return to once the preferred one is out of cooldown.
  *
- * Pure functions over the configured chain plus a failure ledger, so they can
+ * Pure functions over the configured chain plus a failure ledger, so both can
  * be unit-tested without booting a pi session.
  */
 
@@ -17,12 +17,45 @@ export function chainIndex(models: ChainModel[], key: string): number {
   return models.findIndex((m) => modelKey(m) === key);
 }
 
+export interface SelectOptions {
+  /** modelKey that just failed; never returned. */
+  failedKey?: string;
+  /** Resume the walk after this chain index (used when setModel failed). */
+  afterIndex?: number;
+  /** Cooldown used for keys with no explicit cooldown. */
+  fallbackCooldownMs: number;
+  now?: number;
+}
+
+/**
+ * Next model in chain order *after* the failed one, wrapping to the head.
+ *
+ * Earlier versions returned the earliest non-cooling model anywhere in the
+ * chain, which made pinball bounce backwards (failing on chain position 2
+ * landed on position 1) and skip every model between the failure and the head.
+ */
+export function findNextModel(models: ChainModel[], ledger: FailureLedger, opts: SelectOptions): ChainModel | null {
+  const n = models.length;
+  if (n === 0) return null;
+  const now = opts.now ?? Date.now();
+  const start = opts.afterIndex !== undefined
+    ? opts.afterIndex + 1
+    : (opts.failedKey ? chainIndex(models, opts.failedKey) : -1) + 1;
+  for (let i = 0; i < n; i++) {
+    const model = models[(Math.max(0, start) + i) % n];
+    const key = modelKey(model);
+    if (opts.failedKey && key === opts.failedKey) continue;
+    if (isCooling(ledger, key, opts.fallbackCooldownMs, now)) continue;
+    return model;
+  }
+  return null;
+}
+
 export interface PreferredOptions {
   /** ModelKey of the model currently in use. */
   currentKey?: string;
   /** modelKey of the model the session started on. */
   originalKey?: string | null;
-  /** Cooldown used for keys with no explicit cooldown. */
   fallbackCooldownMs: number;
   now?: number;
 }
