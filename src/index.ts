@@ -5,7 +5,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { backoffFor, classifyError, DEFAULT_TRANSIENT_BACKOFF_MS, parseResetHint, type ErrorClass } from "./classify";
 import { chainIndex, findNextModel, findPreferredModel, modelKey } from "./chain";
 import { activeFailures, clearFailure, markFailure, type FailureLedger } from "./cooldown";
-import { isRecoveryStop, nextPreferredOnModelSelect, shouldCancelRetriesOnInput, shouldScheduleRetryAfterSettle } from "./policy";
+import { isRecoveryStop, isStaleContinuation, nextPreferredOnModelSelect, shouldCancelRetriesOnInput, shouldScheduleRetryAfterSettle, type UserMessageRef } from "./policy";
 
 interface PinballModel { provider: string; id: string; name?: string; reasoning?: boolean }
 interface PinballConfig {
@@ -99,7 +99,8 @@ export default function pinballExtension(pi: ExtensionAPI) {
   let config: PinballConfig = { ...DEFAULT_CONFIG, models: [] };
   let configLoaded = false;
   let originalModel: { provider: string; id: string } | null = null;
-  let pendingRetryMessage: string | null = null;
+  /** Parked retry continuation, tagged with when it was parked for staleness checks. */
+  let pendingRetryMessage: { content: string; parkedAt: number } | null = null;
   /** True while pinball itself is switching models (suppresses model_select handling). */
   let selfModelSwitch = false;
   /** Outcome of the most recent turn boundary ("completed" | "aborted" | "error"), if any. */
@@ -295,7 +296,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
       pendingTransient.delete(key);
       if (!ensureConfig().enabled) return;
       if (ctx.isIdle()) void dispatchRetry(text);
-      else pendingRetryMessage = text;
+      else pendingRetryMessage = { content: text, parkedAt: Date.now() };
     }, delayMs);
     timers.add(timer);
   }
@@ -382,10 +383,14 @@ export default function pinballExtension(pi: ExtensionAPI) {
     if (kind === "transient") {
       const budget = transientRetryBudget();
       const spent = state.transientAttempts.get(failedKey) ?? 0;
-      if (spent < budget && !pendingTransient.has(failedKey)) {
+      // A retry for this failure streak is already ticking — settle again for
+      // the same error must not schedule a second one or bounce prematurely.
+      if (pendingTransient.has(failedKey)) return;
+      if (spent < budget) {
         const attempt = spent + 1;
         const delayMs = backoffFor(attempt, backoffSchedule());
         state.transientAttempts.set(failedKey, attempt);
+        // The same-model attempt is the single retry counted for this failure.
         state.retryCount++;
         if (cfg.notifyOnBounce) {
           ctx.ui.notify(`⏳ ${failedKey} transient error; retry ${attempt}/${budget} on the same model in ${formatDuration(delayMs)}`, "info");
@@ -394,6 +399,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
         scheduleTransientRetry(ctx, failedKey, transientRetryMessage(failedKey, attempt, budget, delayMs, lastError), delayMs);
         return;
       }
+      // Budget exhausted: fall through to the bounce, which counts this retry.
     }
 
     const resetHintMs = kind === "quota" ? parseResetHint(lastError) : null;
@@ -414,7 +420,7 @@ export default function pinballExtension(pi: ExtensionAPI) {
 
     const text = bounceRetryMessage(failedKey, modelKey(target), lastError);
     if (ctx.isIdle()) await dispatchRetry(text);
-    else pendingRetryMessage = text;
+    else pendingRetryMessage = { content: text, parkedAt: Date.now() };
   });
 
   pi.on("agent_before_settle", (event) => {
@@ -450,15 +456,37 @@ export default function pinballExtension(pi: ExtensionAPI) {
     pendingRetryMessage = null;
   });
 
+  /** Text of user messages in the branch, for stale-continuation checks. */
+  function branchUserMessageRefs(ctx: ExtensionContext): UserMessageRef[] {
+    const out: UserMessageRef[] = [];
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "message" || entry.message.role !== "user") continue;
+      const m = entry.message;
+      const timestamp = typeof m.timestamp === "number" ? m.timestamp : Date.parse(entry.timestamp);
+      const content: unknown = m.content;
+      const text = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.map((p) => (p && typeof p === "object" && "text" in p ? String((p as { text: unknown }).text ?? "") : "")).join(" ")
+          : "";
+      out.push({ timestamp, text });
+    }
+    return out;
+  }
+
   pi.on("before_agent_start", async (_event, ctx) => {
     if (ensureConfig().enabled && ensureConfig().returnToPreferred !== false && !state.gaveUp) {
       try { await returnToPreferredModel(ctx); }
       catch (err) { console.warn(`[pinball] return-to-preferred failed: ${err}`); }
     }
     if (!pendingRetryMessage) return;
-    const content = pendingRetryMessage;
+    const parked = pendingRetryMessage;
     pendingRetryMessage = null;
-    return { message: { customType: "pinball-retry", content, display: false } };
+    // Drop the continuation if the branch has moved on since it was parked —
+    // injecting it would append a stale "retry the failed step" to an
+    // unrelated turn. Pinball's own continuation matches the parked text.
+    if (isStaleContinuation(parked.parkedAt, parked.content, branchUserMessageRefs(ctx))) return;
+    return { message: { customType: "pinball-retry", content: parked.content, display: false } };
   });
 
   pi.registerCommand("pinball", {

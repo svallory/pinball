@@ -1,6 +1,45 @@
 import { describe, expect, test } from "bun:test";
 
-import { isRecoveryStop, nextPreferredOnModelSelect, shouldCancelRetriesOnInput, shouldScheduleRetryAfterSettle } from "../src/policy";
+import {
+  isRecoveryStop,
+  isStaleContinuation,
+  nextPreferredOnModelSelect,
+  shouldCancelRetriesOnInput,
+  shouldScheduleRetryAfterSettle,
+  type UserMessageRef,
+} from "../src/policy";
+
+describe("isStaleContinuation", () => {
+  const parkedAt = 1_000;
+  const content = "[pinball] mock/flaky-529 transient provider error (…). Same-model retry 1/3 …";
+
+  test("no user messages after parking — fresh", () => {
+    expect(isStaleContinuation(parkedAt, content, [])).toBe(false);
+  });
+
+  test("only older user messages — fresh", () => {
+    const msgs: UserMessageRef[] = [{ timestamp: 500, text: "do the thing" }];
+    expect(isStaleContinuation(parkedAt, content, msgs)).toBe(false);
+  });
+
+  test("pinball's own continuation (identical text) keeps it fresh", () => {
+    const msgs: UserMessageRef[] = [{ timestamp: 2_000, text: content }];
+    expect(isStaleContinuation(parkedAt, content, msgs)).toBe(false);
+  });
+
+  test("a newer, different user message makes it stale", () => {
+    const msgs: UserMessageRef[] = [
+      { timestamp: 500, text: "do the thing" },
+      { timestamp: 2_000, text: "unrelated new prompt" },
+    ];
+    expect(isStaleContinuation(parkedAt, content, msgs)).toBe(true);
+  });
+
+  test("comparison trims whitespace", () => {
+    const msgs: UserMessageRef[] = [{ timestamp: 2_000, text: `  ${content}\n` }];
+    expect(isStaleContinuation(parkedAt, content, msgs)).toBe(false);
+  });
+});
 
 describe("shouldCancelRetriesOnInput", () => {
   test("interactive input cancels scheduled retries", () => {

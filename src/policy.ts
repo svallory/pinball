@@ -51,3 +51,17 @@ export function shouldCancelRetriesOnInput(source: string): boolean {
 export function shouldScheduleRetryAfterSettle(outcome: string | null): boolean {
   return outcome !== "aborted";
 }
+
+export interface UserMessageRef { timestamp: number; text: string }
+
+/**
+ * A retry continuation parked while the session was busy is stale once a
+ * *different* user message landed after it was parked — injecting it would
+ * append a stale "retry the failed step" instruction to an unrelated turn.
+ * Messages identical to the parked content (pinball's own continuation)
+ * keep it fresh.
+ */
+export function isStaleContinuation(parkedAt: number, content: string, userMessages: UserMessageRef[]): boolean {
+  const trimmed = content.trim();
+  return userMessages.some((m) => m.timestamp > parkedAt && m.text.trim() !== trimmed);
+}
